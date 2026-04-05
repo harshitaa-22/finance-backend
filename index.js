@@ -14,7 +14,7 @@ function authMiddleware(req, res, next) {
   const token = authHeader.split(" ")[1];
 
   try {
-    const decoded = jwt.verify(token, "secretkey");
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || "secretkey");
 
     req.user = decoded;
     next();
@@ -88,7 +88,7 @@ app.post("/login", (req, res) => {
     const isMatch = bcrypt.compareSync(password, user.password);
 
     if (!isMatch) {
-      return res.status(401).json({ message: "Invalid password" });
+      return res.status(401).json({ message: "Invalid credentials" });
     }
 
     const token = jwt.sign(
@@ -115,7 +115,41 @@ app.get("/profile", authMiddleware, (req, res) => {
 });
 
 app.get("/dashboard", authMiddleware, (req, res) => {
-  res.json({ message: "Dashboard data visible to all logged-in users" });
+  const userId = req.user.id;
+
+  const incomeQuery = `
+    SELECT SUM(amount) as totalIncome 
+    FROM records 
+    WHERE user_id = ? AND type = 'income'
+  `;
+
+  const expenseQuery = `
+    SELECT SUM(amount) as totalExpense 
+    FROM records 
+    WHERE user_id = ? AND type = 'expense'
+  `;
+
+  db.get(incomeQuery, [userId], (err, incomeResult) => {
+    if (err) {
+      return res.status(500).json({ message: "Error fetching income" });
+    }
+
+    db.get(expenseQuery, [userId], (err, expenseResult) => {
+      if (err) {
+        return res.status(500).json({ message: "Error fetching expenses" });
+      }
+
+      const totalIncome = incomeResult.totalIncome || 0;
+      const totalExpense = expenseResult.totalExpense || 0;
+      const balance = totalIncome - totalExpense;
+
+      res.json({
+        totalIncome,
+        totalExpense,
+        balance,
+      });
+    });
+  });
 });
 
 app.get(
@@ -128,25 +162,166 @@ app.get(
 );
 
 app.delete(
-  "/admin/delete-user",
+  "/admin/delete-user/:id",
   authMiddleware,
   roleMiddleware(["admin"]),
   (req, res) => {
-    res.json({ message: "User deleted by admin" });
+    const userId = req.params.id;
+
+    db.run("DELETE FROM users WHERE id = ?", [userId], function (err) {
+      if (err) {
+        return res.status(500).json({ message: "Error deleting user" });
+      }
+
+      if (this.changes === 0) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      res.json({
+        message: "User deleted",
+        deletedId: userId,
+      });
+    });
   },
 );
 
-app.get("/make-admin", (req, res) => {
-  db.run(
-    "UPDATE users SET role = 'admin' WHERE email = 'harshi@test.com'",
-    function (err) {
+app.post(
+  "/records",
+  authMiddleware,
+  roleMiddleware(["admin", "analyst"]),
+  (req, res) => {
+    const { amount, type, category, date, notes } = req.body;
+
+    if (!amount || !type || !category) {
+      return res.status(400).json({ message: "Required fields missing" });
+    }
+
+    if (!["income", "expense"].includes(type)) {
+      return res.status(400).json({ message: "Invalid type" });
+    }
+
+    if (amount <= 0) {
+      return res.status(400).json({ message: "Amount must be positive" });
+    }
+
+    const query = `
+      INSERT INTO records (user_id, amount, type, category, date, notes)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `;
+
+    db.run(
+      query,
+      [req.user.id, amount, type, category, date, notes],
+      function (err) {
+        if (err) {
+          return res.status(500).json({ message: "Error adding record" });
+        }
+
+        res.json({
+          message: "Record added",
+          recordId: this.lastID,
+        });
+      },
+    );
+  },
+);
+
+app.get("/records", authMiddleware, (req, res) => {
+  db.all(
+    "SELECT * FROM records WHERE user_id = ?",
+    [req.user.id],
+    (err, rows) => {
       if (err) {
-        return res.json({ error: err.message });
+        return res.status(500).json({ message: "Error fetching records" });
       }
-      res.json({ message: "User is now admin" });
+
+      res.json(rows);
     },
   );
 });
+
+app.put("/records/:id", authMiddleware, (req, res) => {
+  const { amount, type, category, date, notes } = req.body;
+  if (!amount || !type || !category) {
+    return res.status(400).json({ message: "Required fields missing" });
+  }
+
+  if (!["income", "expense"].includes(type)) {
+    return res.status(400).json({ message: "Invalid type" });
+  }
+
+  if (amount <= 0) {
+    return res.status(400).json({ message: "Amount must be positive" });
+  }
+  const recordId = req.params.id;
+
+  db.run(
+    `UPDATE records 
+     SET amount=?, type=?, category=?, date=?, notes=? 
+     WHERE id=? AND user_id=?`,
+    [amount, type, category, date, notes, recordId, req.user.id],
+    function (err) {
+      if (err) {
+        return res.status(500).json({ message: "Error updating record" });
+      }
+
+      if (this.changes === 0) {
+        return res.status(404).json({ message: "Record not found" });
+      }
+
+      res.json({ message: "Record updated" });
+    },
+  );
+});
+
+app.delete("/records/:id", authMiddleware, (req, res) => {
+  const recordId = req.params.id;
+
+  db.run(
+    "DELETE FROM records WHERE id=? AND user_id=?",
+    [recordId, req.user.id],
+    function (err) {
+      if (err) {
+        return res.status(500).json({ message: "Error deleting record" });
+      }
+
+      if (this.changes === 0) {
+        return res.status(404).json({ message: "Record not found" });
+      }
+
+      res.json({ message: "Record deleted" });
+    },
+  );
+});
+
+app.patch(
+  "/admin/update-role/:id",
+  authMiddleware,
+  roleMiddleware(["admin"]),
+  (req, res) => {
+    const { role } = req.body;
+    if (!["admin", "analyst", "viewer"].includes(role)) {
+      return res.status(400).json({ message: "Invalid role" });
+    }
+    const userId = req.params.id;
+
+    db.run(
+      "UPDATE users SET role = ? WHERE id = ?",
+      [role, userId],
+      function (err) {
+        if (err) {
+          return res.status(500).json({ message: "Error updating role" });
+        }
+
+        if (this.changes === 0) {
+          return res.status(404).json({ message: "User not found" });
+        }
+
+        res.json({ message: "Role updated" });
+      },
+    );
+  },
+);
 
 db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS users (

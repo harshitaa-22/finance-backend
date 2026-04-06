@@ -1,8 +1,17 @@
+require("dotenv").config();
 const express = require("express");
 const app = express();
 const db = require("./db");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error(
+    "ERROR: JWT_SECRET is not set. Create a .env file with JWT_SECRET=<your-secret>",
+  );
+  process.exit(1);
+}
 
 function authMiddleware(req, res, next) {
   const authHeader = req.headers["authorization"];
@@ -14,7 +23,7 @@ function authMiddleware(req, res, next) {
   const token = authHeader.split(" ")[1];
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || "secretkey");
+    const decoded = jwt.verify(token, JWT_SECRET);
 
     req.user = decoded;
     next();
@@ -50,19 +59,28 @@ app.post("/signup", (req, res) => {
 
   const hashedPassword = bcrypt.hashSync(password, 10);
 
-  const query = `INSERT INTO users (name, email, password) VALUES (?, ?, ?)`;
-
-  db.run(query, [name, email, hashedPassword], function (err) {
+  // First user becomes admin, everyone else is viewer
+  db.get("SELECT COUNT(*) as count FROM users", (err, row) => {
     if (err) {
-      if (err.message.includes("UNIQUE")) {
-        return res.status(400).json({ message: "Email already exists" });
-      }
       return res.status(500).json({ message: "Server error" });
     }
 
-    res.status(201).json({
-      message: "User created successfully",
-      userId: this.lastID,
+    const role = row.count === 0 ? "admin" : "viewer";
+    const query = `INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, ?)`;
+
+    db.run(query, [name, email, hashedPassword, role], function (err) {
+      if (err) {
+        if (err.message.includes("UNIQUE")) {
+          return res.status(400).json({ message: "Email already exists" });
+        }
+        return res.status(500).json({ message: "Server error" });
+      }
+
+      res.status(201).json({
+        message: "User created successfully",
+        userId: this.lastID,
+        role: role,
+      });
     });
   });
 });
@@ -96,7 +114,7 @@ app.post("/login", (req, res) => {
         id: user.id,
         role: user.role,
       },
-      process.env.JWT_SECRET || "secretkey",
+      JWT_SECRET,
       { expiresIn: "1h" },
     );
 
@@ -108,10 +126,19 @@ app.post("/login", (req, res) => {
 });
 
 app.get("/profile", authMiddleware, (req, res) => {
-  res.json({
-    message: "This is protected data",
-    user: req.user,
-  });
+  db.get(
+    "SELECT id, name, email, role FROM users WHERE id = ?",
+    [req.user.id],
+    (err, user) => {
+      if (err) {
+        return res.status(500).json({ message: "Error fetching profile" });
+      }
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+      res.json({ user });
+    },
+  );
 });
 
 app.get("/dashboard", authMiddleware, (req, res) => {
@@ -157,7 +184,51 @@ app.get(
   authMiddleware,
   roleMiddleware(["analyst", "admin"]),
   (req, res) => {
-    res.json({ message: "Analytics data for analyst/admin" });
+    const userId = req.user.id;
+
+    const categoryQuery = `
+      SELECT type, category, SUM(amount) as total, COUNT(*) as count
+      FROM records WHERE user_id = ?
+      GROUP BY type, category
+    `;
+
+    const monthlyQuery = `
+      SELECT strftime('%Y-%m', date) as month, type, SUM(amount) as total
+      FROM records WHERE user_id = ? AND date IS NOT NULL
+      GROUP BY month, type
+      ORDER BY month DESC
+    `;
+
+    const recentQuery = `
+      SELECT * FROM records WHERE user_id = ?
+      ORDER BY date DESC LIMIT 5
+    `;
+
+    db.all(categoryQuery, [userId], (err, categoryRows) => {
+      if (err) {
+        return res.status(500).json({ message: "Error fetching analytics" });
+      }
+
+      db.all(monthlyQuery, [userId], (err, monthlyRows) => {
+        if (err) {
+          return res.status(500).json({ message: "Error fetching analytics" });
+        }
+
+        db.all(recentQuery, [userId], (err, recentRows) => {
+          if (err) {
+            return res
+              .status(500)
+              .json({ message: "Error fetching analytics" });
+          }
+
+          res.json({
+            categoryBreakdown: categoryRows,
+            monthlyTrends: monthlyRows,
+            recentActivity: recentRows,
+          });
+        });
+      });
+    });
   },
 );
 
@@ -168,18 +239,30 @@ app.delete(
   (req, res) => {
     const userId = req.params.id;
 
-    db.run("DELETE FROM users WHERE id = ?", [userId], function (err) {
+    if (parseInt(userId) === req.user.id) {
+      return res
+        .status(400)
+        .json({ message: "Cannot delete your own account" });
+    }
+
+    db.run("DELETE FROM records WHERE user_id = ?", [userId], function (err) {
       if (err) {
-        return res.status(500).json({ message: "Error deleting user" });
+        return res.status(500).json({ message: "Error deleting user records" });
       }
 
-      if (this.changes === 0) {
-        return res.status(404).json({ message: "User not found" });
-      }
+      db.run("DELETE FROM users WHERE id = ?", [userId], function (err) {
+        if (err) {
+          return res.status(500).json({ message: "Error deleting user" });
+        }
 
-      res.json({
-        message: "User deleted",
-        deletedId: userId,
+        if (this.changes === 0) {
+          return res.status(404).json({ message: "User not found" });
+        }
+
+        res.json({
+          message: "User deleted",
+          deletedId: userId,
+        });
       });
     });
   },
@@ -304,6 +387,10 @@ app.patch(
       return res.status(400).json({ message: "Invalid role" });
     }
     const userId = req.params.id;
+
+    if (parseInt(userId) === req.user.id) {
+      return res.status(400).json({ message: "Cannot change your own role" });
+    }
 
     db.run(
       "UPDATE users SET role = ? WHERE id = ?",
